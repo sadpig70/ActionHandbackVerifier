@@ -2,12 +2,9 @@
 """Deterministic sample packets for ActionHandbackVerifier."""
 
 import copy
-import hashlib
 import json
 
-
-def _digest(label):
-    return hashlib.sha256(label.encode("utf-8")).hexdigest()
+from .verifier import digest_public_surface
 
 
 VALID_PACKET = {
@@ -16,6 +13,7 @@ VALID_PACKET = {
     "delegation": {
         "authority_id": "AUTH-17",
         "delegated_to": "field-agent-7",
+        "return_to": "AUTH-17",
         "action": "retrieve_artifact",
         "allowed_actions": ["retrieve_artifact", "return_to_base"],
         "expires_at": "2026-07-03T00:00:00+00:00",
@@ -23,8 +21,8 @@ VALID_PACKET = {
     },
     "custody": {
         "artifact_id": "ART-42",
-        "from_actor": "warehouse-2",
-        "to_actor": "field-agent-7",
+        "from_actor": "field-agent-7",
+        "to_actor": "AUTH-17",
         "handback_confirmed": True,
         "evidence_path": "evidence/custody/ART-42.json"
     },
@@ -41,7 +39,7 @@ VALID_PACKET = {
         "evidence_path": "evidence/rollback/not-required.json"
     },
     "trace": {
-        "digest": _digest("HB-VALID-001-public-trace"),
+        "digest": "",
         "evidence_path": "evidence/trace/HB-VALID-001.sha256"
     }
 }
@@ -54,14 +52,23 @@ THIN_PACKET["route"]["rollback_required"] = True
 THIN_PACKET["rollback"]["required"] = True
 THIN_PACKET["rollback"]["completed"] = True
 THIN_PACKET["rollback"].pop("restoration_hash", None)
-THIN_PACKET["trace"]["digest"] = _digest("HB-THIN-001-public-trace")
 
 BREACH_PACKET = copy.deepcopy(VALID_PACKET)
 BREACH_PACKET["handback_id"] = "HB-BREACH-001"
 BREACH_PACKET["delegation"]["action"] = "open_restricted_zone"
 BREACH_PACKET["custody"]["handback_confirmed"] = False
 BREACH_PACKET["route"]["status"] = "passed"
-BREACH_PACKET["trace"]["digest"] = _digest("HB-BREACH-001-public-trace")
+
+
+def _bound(packet):
+    packet = copy.deepcopy(packet)
+    packet["trace"]["digest"] = digest_public_surface(packet, omit_trace_digest=True)
+    return packet
+
+
+VALID_PACKET = _bound(VALID_PACKET)
+THIN_PACKET = _bound(THIN_PACKET)
+BREACH_PACKET = _bound(BREACH_PACKET)
 
 
 def samples():

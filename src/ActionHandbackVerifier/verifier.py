@@ -9,6 +9,7 @@ import re
 
 SEVERITY = {"valid": 0, "thin": 1, "breach": 2}
 PRIVATE_KEYS = {"payload", "private_payload", "raw_payload", "secret", "secrets"}
+EVIDENCE_PATH_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
 
 
 def _check(name, verdict, reason, evidence_path=""):
@@ -67,6 +68,13 @@ def is_sha256_hex(value):
     return bool(re.fullmatch(r"[0-9a-f]{64}", str(value or "")))
 
 
+def valid_evidence_path(value):
+    text = str(value or "")
+    if not text or text.startswith(("/", "\\")) or ".." in text.replace("\\", "/").split("/"):
+        return False
+    return bool(EVIDENCE_PATH_RE.fullmatch(text)) and text.replace("\\", "/").startswith("evidence/")
+
+
 def has_private_payload(value):
     if isinstance(value, dict):
         for key, sub in value.items():
@@ -79,22 +87,29 @@ def has_private_payload(value):
     return False
 
 
-def _public_copy(value):
+def _public_copy(value, omit_trace_digest=False, path=()):
     if isinstance(value, dict):
         return {
-            k: _public_copy(v)
+            k: _public_copy(v, omit_trace_digest, path + (str(k),))
             for k, v in sorted(value.items())
             if str(k).lower() not in PRIVATE_KEYS
+            and not (omit_trace_digest and path == ("trace",) and str(k) == "digest")
         }
     if isinstance(value, list):
-        return [_public_copy(v) for v in value]
+        return [_public_copy(v, omit_trace_digest, path) for v in value]
     return value
 
 
-def digest_public_surface(packet):
-    public = _public_copy(packet)
+def digest_public_surface(packet, omit_trace_digest=False):
+    public = _public_copy(packet, omit_trace_digest=omit_trace_digest)
     payload = json.dumps(public, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def invalid_evidence_path_check(name, evidence_path):
+    if not valid_evidence_path(evidence_path):
+        return breach(name, "invalid evidence path", evidence_path)
+    return None
 
 
 def check_authority(packet):
@@ -102,6 +117,9 @@ def check_authority(packet):
     miss = missing(["authority_id", "delegated_to", "action", "allowed_actions", "evidence_path"], delegation)
     if miss:
         return thin_or_breach("authority", miss)
+    invalid = invalid_evidence_path_check("authority", delegation.get("evidence_path"))
+    if invalid:
+        return invalid
     if delegation["action"] not in delegation.get("allowed_actions", []):
         return breach("authority", "action outside delegated authority", delegation.get("evidence_path"))
     if expired(delegation.get("expires_at"), packet.get("handback_time")):
@@ -114,9 +132,15 @@ def check_custody(packet):
     miss = missing(["artifact_id", "from_actor", "to_actor", "handback_confirmed", "evidence_path"], custody)
     if miss:
         return thin_or_breach("custody", miss)
+    invalid = invalid_evidence_path_check("custody", custody.get("evidence_path"))
+    if invalid:
+        return invalid
     delegated_to = packet.get("delegation", {}).get("delegated_to")
-    if delegated_to and custody.get("to_actor") != delegated_to:
-        return breach("custody", "custody receiver does not match delegated actor", custody.get("evidence_path"))
+    return_to = packet.get("delegation", {}).get("return_to", packet.get("delegation", {}).get("authority_id"))
+    if delegated_to and custody.get("from_actor") != delegated_to:
+        return breach("custody", "custody sender does not match delegated actor", custody.get("evidence_path"))
+    if return_to and custody.get("to_actor") != return_to:
+        return breach("custody", "custody receiver does not match return actor", custody.get("evidence_path"))
     if custody.get("handback_confirmed") is not True:
         return breach("custody", "handback not confirmed", custody.get("evidence_path"))
     return valid("custody", custody.get("evidence_path"))
@@ -127,9 +151,14 @@ def check_route(packet):
     miss = missing(["planned_route_id", "actual_route_id", "status", "evidence_path"], route)
     if miss:
         return thin_or_breach("route", miss)
+    invalid = invalid_evidence_path_check("route", route.get("evidence_path"))
+    if invalid:
+        return invalid
     status = route.get("status")
     if status == "failed":
         return breach("route", "route check failed", route.get("evidence_path"))
+    if status == "passed" and route.get("planned_route_id") != route.get("actual_route_id"):
+        return breach("route", "passed route has planned/actual mismatch", route.get("evidence_path"))
     if status == "deviated" and route.get("rollback_required") is not True:
         return thin("route", "route deviated but rollback requirement is not declared", route.get("evidence_path"))
     if status not in ("passed", "deviated"):
@@ -142,10 +171,15 @@ def check_rollback(packet):
     miss = missing(["required", "completed", "evidence_path"], rollback)
     if miss:
         return thin_or_breach("rollback", miss)
+    invalid = invalid_evidence_path_check("rollback", rollback.get("evidence_path"))
+    if invalid:
+        return invalid
     if rollback.get("required") is True and rollback.get("completed") is not True:
         return breach("rollback", "required rollback not completed", rollback.get("evidence_path"))
     if rollback.get("required") is True and not rollback.get("restoration_hash"):
         return thin("rollback", "rollback completed without restoration_hash", rollback.get("evidence_path"))
+    if rollback.get("restoration_hash") and not is_sha256_hex(rollback.get("restoration_hash")):
+        return breach("rollback", "restoration_hash is not sha256 hex", rollback.get("evidence_path"))
     return valid("rollback", rollback.get("evidence_path"))
 
 
@@ -155,8 +189,14 @@ def check_trace(packet):
         return breach("trace", "packet contains private payload field", trace.get("evidence_path", ""))
     if not trace.get("digest") or not trace.get("evidence_path"):
         return thin("trace", "trace digest or evidence_path missing", trace.get("evidence_path", ""))
+    invalid = invalid_evidence_path_check("trace", trace.get("evidence_path"))
+    if invalid:
+        return invalid
     if not is_sha256_hex(trace.get("digest")):
         return breach("trace", "trace digest is not sha256 hex", trace.get("evidence_path"))
+    expected = digest_public_surface(packet, omit_trace_digest=True)
+    if trace.get("digest") != expected:
+        return breach("trace", "trace digest does not bind public surface", trace.get("evidence_path"))
     return valid("trace", trace.get("evidence_path"))
 
 
@@ -179,7 +219,7 @@ def evaluate_handback(packet):
         "handback_id": packet.get("handback_id", ""),
         "verdict": verdict,
         "checks": checks,
-        "aggregate_digest": digest_public_surface(packet),
+        "aggregate_digest": digest_public_surface(packet, omit_trace_digest=True),
     }
 
 

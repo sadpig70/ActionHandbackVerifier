@@ -36,6 +36,10 @@ def cmd_run(args):
     _dump_json(result, args.out)
     if getattr(args, "ledger", None):
         append_record(args.ledger, result)
+    if getattr(args, "fail_on_breach", False) and result["verdict"] == "breach":
+        return 1
+    if getattr(args, "strict", False) and result["verdict"] != "valid":
+        return 1
     return 0 if result["verdict"] in {"valid", "thin", "breach"} else 1
 
 
@@ -69,6 +73,8 @@ def build_parser():
     run.add_argument("--input", required=True)
     run.add_argument("--out")
     run.add_argument("--ledger", help="append a hash-chain record to this ledger.jsonl path")
+    run.add_argument("--strict", action="store_true", help="exit non-zero unless verdict is valid")
+    run.add_argument("--fail-on-breach", action="store_true", help="exit non-zero when verdict is breach")
     run.set_defaults(func=cmd_run)
 
     report = sub.add_parser("report", help="render a Markdown report for one handback packet")

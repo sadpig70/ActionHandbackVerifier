@@ -15,7 +15,11 @@ if SRC not in sys.path:
 ENV = {**os.environ, "PYTHONPATH": SRC}
 
 from ActionHandbackVerifier.samples import samples  # noqa: E402
-from ActionHandbackVerifier.verifier import evaluate_handback, has_private_payload  # noqa: E402
+from ActionHandbackVerifier.verifier import (  # noqa: E402
+    digest_public_surface,
+    evaluate_handback,
+    has_private_payload,
+)
 from ActionHandbackVerifier.ledger import append_record, verify_ledger  # noqa: E402
 
 
@@ -35,6 +39,36 @@ class TestActionHandbackVerifierStandalone(unittest.TestCase):
         packet["private_payload"] = {"operator_note": "do not store"}
         self.assertTrue(has_private_payload(packet))
         self.assertEqual(evaluate_handback(packet)["verdict"], "breach")
+
+    def test_custody_must_return_from_delegate_to_return_actor(self):
+        packet = samples()["valid"]
+        packet["custody"]["from_actor"] = "warehouse-2"
+        result = evaluate_handback(packet)
+        self.assertEqual(result["verdict"], "breach")
+        self.assertIn("custody sender", [c for c in result["checks"] if c["name"] == "custody"][0]["reason"])
+
+    def test_passed_route_with_mismatch_is_breach(self):
+        packet = samples()["valid"]
+        packet["route"]["actual_route_id"] = "ROUTE-B"
+        packet["trace"]["digest"] = digest_public_surface(packet, omit_trace_digest=True)
+        result = evaluate_handback(packet)
+        self.assertEqual(result["verdict"], "breach")
+        self.assertIn("planned/actual mismatch", [c for c in result["checks"] if c["name"] == "route"][0]["reason"])
+
+    def test_trace_digest_binds_public_surface(self):
+        packet = samples()["valid"]
+        packet["route"]["actual_route_id"] = "ROUTE-B"
+        result = evaluate_handback(packet)
+        self.assertEqual(result["verdict"], "breach")
+        self.assertIn("public surface", [c for c in result["checks"] if c["name"] == "trace"][0]["reason"])
+
+    def test_restoration_hash_must_be_sha256_when_present(self):
+        packet = samples()["valid"]
+        packet["rollback"]["restoration_hash"] = "not-a-sha"
+        packet["trace"]["digest"] = digest_public_surface(packet, omit_trace_digest=True)
+        result = evaluate_handback(packet)
+        self.assertEqual(result["verdict"], "breach")
+        self.assertIn("restoration_hash", [c for c in result["checks"] if c["name"] == "rollback"][0]["reason"])
 
     def test_cli_sample_run_report(self):
         with tempfile.TemporaryDirectory() as d:
@@ -60,6 +94,32 @@ class TestActionHandbackVerifierStandalone(unittest.TestCase):
             )
             self.assertIn("# ActionHandbackVerifier Report", report)
             self.assertIn("authority", report)
+
+    def test_cli_strict_returns_nonzero_for_thin(self):
+        with tempfile.TemporaryDirectory() as d:
+            subprocess.check_output(
+                [sys.executable, "-m", "ActionHandbackVerifier", "sample", "--out", d],
+                cwd=ROOT,
+                env=ENV,
+                text=True,
+            )
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "ActionHandbackVerifier",
+                    "run",
+                    "--input",
+                    os.path.join(d, "thin.json"),
+                    "--strict",
+                ],
+                cwd=ROOT,
+                env=ENV,
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertEqual(json.loads(proc.stdout)["verdict"], "thin")
 
 
 class TestLedger(unittest.TestCase):
